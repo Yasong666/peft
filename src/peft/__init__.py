@@ -72,6 +72,8 @@ from .tuners import (
     PromptEncoderReparameterizationType,
     PromptTuningConfig,
     PromptTuningInit,
+    PloraConfig,
+    PloraModel,
     MultitaskPromptTuningConfig,
     MultitaskPromptTuningInit,
     OFTConfig,

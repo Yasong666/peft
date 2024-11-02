@@ -32,7 +32,8 @@ class PloraLayer(BaseTunerLayer):
         self.r = {}
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
-        self.W_1 = nn.ModuleDict({})
+        self.lora_givens = nn.ParameterDict()
+        self.W_1 = nn.ParameterDict()
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -59,8 +60,13 @@ class PloraLayer(BaseTunerLayer):
             lora_dropout_layer = nn.Identity()
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
+        angles = torch.zeros(self.in_features // 2)#整除
+        self.lora_givens[adapter_name] = nn.Parameter(angles)
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
-
+        for param in self.lora_A[adapter_name].parameters():
+            param.requires_grad = True  # 设置为可训练
+        if adapter_name not in self.W_1:
+            self.W_1[adapter_name] = nn.Parameter(torch.empty((self.out_features, self.in_features), dtype=torch.float32))
         if init_weights:
             with gather_params_ctx(self.get_base_layer().weight):
                 self.plora_init(adapter_name, init_weights)
@@ -80,12 +86,13 @@ class PloraLayer(BaseTunerLayer):
         # Sr /= self.scaling[adapter_name]
         Uhr = Uh[: self.r[adapter_name]]
         lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
-        lora_A = lora_A.T
-        W_0 = torch.diag(torch.sqrt(S[self.r[adapter_name:]])) @ Uh[self.r[adapter_name:]]
+
+        W_0 = torch.diag(torch.sqrt(S[self.r[adapter_name]:])) @ Uh[self.r[adapter_name]:]
         W_0 = W_0.T @ W_0
-        W_1 = V@Uh
-        self.lora_A[adapter_name] = lora_A
-        self.W_1[adapter_name] = nn.Parameter(W_1, requires_grad=False)
+        W_ = V@Uh
+        self.lora_A[adapter_name].weight.data = lora_A
+        with torch.no_grad():
+            self.W_1[adapter_name].data.copy_(W_)
         self.get_base_layer().weight.data = W_0
 
 
@@ -104,7 +111,7 @@ class PloraLinear(nn.Module, PloraLayer):
         PloraLayer.__init__(self, base_layer, **kwargs)
         self.fan_in_fan_out = fan_in_fan_out
 
-        self.active_adapter = adapter_name
+        self._active_adapter = adapter_name
         self.update_layer(adapter_name, r, lora_dropout, init_weights)
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -119,7 +126,8 @@ class PloraLinear(nn.Module, PloraLayer):
                     orig_weights = base_layer.weight.data.clone()
                     delta_weight = self.get_delta_weight(adapter = active_adapter)
                     orig_weights += delta_weight
-                    orig_weights = torch.mm(self.W_1[active_adapter],orig_weights)
+                    orig_weights = self.get_rotation_matric(self.lora_givens[active_adapter].data)@orig_weights
+                    orig_weights = torch.mm(self.W_1[active_adapter].data,orig_weights)
 
                     if not torch.isfinite(orig_weights).all():
                         raise ValueError(
@@ -132,7 +140,8 @@ class PloraLinear(nn.Module, PloraLayer):
                     orig_weights = base_layer.weight.data.clone()
                     delta_weight = self.get_delta_weight(adapter = active_adapter)
                     orig_weights += delta_weight
-                    orig_weights = torch.mm(self.W_1[active_adapter],orig_weights)
+                    orig_weights = self.get_rotation_matric(self.lora_givens[active_adapter].data)@orig_weights
+                    orig_weights = torch.mm(self.W_1[active_adapter].data,orig_weights)
                     base_layer.weight.data = orig_weights.contiguous()
 
                 self.merged_adapters.append(active_adapter)
@@ -146,16 +155,26 @@ class PloraLinear(nn.Module, PloraLayer):
             if active_adapter in self.lora_A.keys():
                 orig_weights = self.get_base_layer().weight
                 delta_weight = self.get_delta_weight(active_adapter)
-                orig_weights = torch.mm(self.W_1[active_adapter].T,orig_weights)
+                orig_weights = torch.mm(self.W_1[active_adapter].data.T,orig_weights)
+                orig_weights = self.get_rotation_matric(self.lora_givens[active_adapter].data).T@orig_weights
                 orig_weights.data -= delta_weight
 
                 self.get_base_layer().weight.data = orig_weights.contiguous()
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
         weight_A = self.lora_A[adapter].weight
-        output_tensor = transpose(weight_A@weight_A.T, fan_in_fan_out=self.fan_in_fan_out)
-        return output_tensor.to
+        output_tensor = transpose(weight_A.T@weight_A, fan_in_fan_out=self.fan_in_fan_out)
+        return output_tensor
 
+    def get_rotation_matric(self, angle:torch.tensor):
+            n = len(angle)
+            rotation = torch.eye(2*n)
+            for index in range(n):
+                rotation[2*index,2*index] = torch.cos(angle[index])
+                rotation[2*index,2*index+1] = torch.sin(angle[index])
+                rotation[2*index+1,2*index] = -torch.sin(angle[index])
+                rotation[2*index+1,2*index+1] = torch.cos(angle[index])
+            return rotation
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.disable_adapters:
@@ -167,15 +186,24 @@ class PloraLinear(nn.Module, PloraLayer):
         else:
             result = self.base_layer(x, *args, **kwargs)#这里以后要改。
             torch_result_dtype = result.dtype
+            rotation = torch.eye(self.in_features, device=x.device, dtype=x.dtype)
+            delta_w = torch.rand(self.in_features,self.in_features, device=x.device, dtype=x.dtype)
+            origin_weight = self.get_base_layer().weight.data
             for active_adapter in self.active_adapters:
+                # print("forward"*10)
                 if active_adapter not in self.lora_A.keys():
                     continue
                 lora_A = self.lora_A[active_adapter]
+                rotation = rotation.to(device=lora_A.weight.device)
                 x = x.to(lora_A.weight.dtype)
-                # result = result + lora_A(dropout(x)) @ lora_A.weight.T @ 
-                delta_w = self.W1[active_adapter]@self.get_delta_weight(active_adapter)
-                result = result + F.linear(x, delta_w)
-
+                # result = result + lora_A(dropout(x)) @ lora_A.weight.T @
+                mat = self.get_rotation_matric(self.lora_givens[active_adapter].data).to(rotation.device)
+                rotation = mat@rotation
+                delta_w = rotation @self.get_delta_weight(active_adapter)
+                new_weight = origin_weight + delta_w
+                ro_weight = torch.mm(rotation, new_weight)
+                new_weight = self.W_1[active_adapter].data@ro_weight
+                result = torch.matmul(x, new_weight)
             result = result.to(torch_result_dtype)
         return result
 

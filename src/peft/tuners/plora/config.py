@@ -22,67 +22,8 @@ from peft.utils import PeftType
 
 
 @dataclass
-class OFTConfig(PeftConfig):
-    """
-    This is the configuration class to store the configuration of a [`OFTModel`].
-
-    Args:
-        r (`int`): OFT rank, number of OFT blocks per injected layer.
-        oft_block_size (`int`): OFT block size across different layers.
-        module_dropout (`float`):
-            The multiplicative dropout probability, by setting OFT blocks to identity during training, similar to the
-            dropout layer in LoRA.
-        target_modules (`Optional[Union[list[str], str]]`):
-            The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
-            names will be replaced. When passing a string, a regex match will be performed. When passing a list of
-            strings, either an exact match will be performed or it is checked if the name of the module ends with any
-            of the passed strings. If this is specified as 'all-linear', then all linear modules are chosen, excluding
-            the output layer. If this is not specified, modules will be chosen according to the model architecture. If
-            the architecture is not known, an error will be raised -- in this case, you should specify the target
-            modules manually.
-        fan_in_fan_out (`bool`): Set this to True if the layer to replace stores weight like (fan_in, fan_out).
-        bias (`str`): Bias type for OFT. Can be 'none', 'all' or 'oft_only'. If 'all' or 'oft_only', the
-            corresponding biases will be updated during training. Be aware that this means that, even when disabling
-            the adapters, the model will not produce the same output as the base model would have without adaptation.
-        exclude_modules (`Optional[Union[List[str], str]]`):
-            The names of the modules to not apply the adapter. When passing a string, a regex match will be performed.
-            When passing a list of strings, either an exact match will be performed or it is checked if the name of the
-            module ends with any of the passed strings.
-        init_weights (`bool`):
-            Whether to perform initialization of OFT weights.
-        layers_to_transform (`Union[List[int], int]`):
-            The layer indices to transform. If a list of ints is passed, it will apply the adapter to the layer indices
-            that are specified in this list. If a single integer is passed, it will apply the transformations on the
-            layer at this index.
-        layers_pattern (`str`):
-            The layer pattern name, used only if `layers_to_transform` is different from `None`.
-        rank_pattern (`dict`):
-            The mapping from layer names or regexp expression to ranks which are different from the default rank
-            specified by `r`.
-        modules_to_save (`List[str]`):
-            List of modules apart from adapter layers to be set as trainable and saved in the final checkpoint.
-        coft (`bool`):
-            Whether to use the constrained variant of OFT or not, off by default.
-        eps (`float`):
-            The control strength of COFT. The freedom of rotation. Only has an effect if `coft` is set to True.
-        block_share (`bool`):
-            Whether to share the OFT parameters between blocks or not. This is `False` by default.
-    """
-
+class PloraConfig(PeftConfig):
     r: int = field(default=8, metadata={"help": "OFT rank, number of OFT blocks per injected layer."})
-    oft_block_size: int = field(
-        default=0,
-        metadata={
-            "help": "OFT block size across different layers.",
-            "note": "You can only specify either r or oft_block_size, but not both simultaneously, because r x oft_block_size = layer dimension.",
-        },
-    )
-    module_dropout: float = field(
-        default=0.0,
-        metadata={
-            "help": "OFT multiplicative dropout, randomly setting blocks of OFT to be identity matrix, similar to the dropout layer in LoRA."
-        },
-    )
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={
@@ -91,6 +32,11 @@ class OFTConfig(PeftConfig):
             "This can also be a wildcard 'all-linear' which matches all linear/Conv1D layers except the output layer."
         },
     )
+    exclude_modules: Optional[Union[list[str], str]] = field(
+        default=None,
+        metadata={"help": "List of module names or regex expression of the module names to exclude from Lora."},
+    )
+    lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
@@ -98,9 +44,13 @@ class OFTConfig(PeftConfig):
     bias: Literal["none", "all", "oft_only"] = field(
         default="none", metadata={"help": "Bias type for OFT. Can be 'none', 'all' or 'oft_only'"}
     )
-    exclude_modules: Optional[Union[list[str], str]] = field(
+    modules_to_save: Optional[list[str]] = field(
         default=None,
-        metadata={"help": "List of module names or regex expression of the module names to exclude from OFT."},
+        metadata={
+            "help": "List of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint. "
+            "For example, in Sequence Classification or Token Classification tasks, "
+            "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
+        },
     )
     init_weights: bool = field(
         default=True,
@@ -123,35 +73,12 @@ class OFTConfig(PeftConfig):
             "help": "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer pattern is not in the common layers pattern."
         },
     )
-    modules_to_save: Optional[list[str]] = field(
-        default=None,
-        metadata={
-            "help": "List of modules apart from OFT layers to be set as trainable and saved in the final checkpoint. "
-            "For example, in Sequence Classification or Token Classification tasks, "
-            "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
-        },
-    )
-    coft: bool = field(
-        default=False,
-        metadata={"help": "Whether to use the constrained variant of OFT or not."},
-    )
-    eps: float = field(
-        default=6e-5,
-        metadata={
-            "help": "The control strength of COFT. The freedom of rotation. Only has an effect if `coft` is set to True."
-        },
-    )
-    block_share: bool = field(
-        default=False,
-        metadata={"help": "Whether to share the OFT parameters between blocks or not."},
-    )
     rank_pattern: Optional[dict] = field(
         default_factory=dict,
         metadata={
             "help": (
                 "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
                 "For example, `{model.decoder.layers.0.encoder_attn.k_proj: 8`}"
-                "Important: the rank pattern won't be applied to the layers after 0.12.1.dev0!"
             )
         },
     )
@@ -167,21 +94,20 @@ class OFTConfig(PeftConfig):
     )
 
     def __post_init__(self):
-        self.peft_type = PeftType.OFT
+        self.peft_type = PeftType.PLORA
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )
         self.exclude_modules = (
             set(self.exclude_modules) if isinstance(self.exclude_modules, list) else self.exclude_modules
         )
-        if self.r == 0 and self.oft_block_size == 0:
-            raise ValueError(
-                f"Either `r` or `oft_block_size` must be non-zero. Currently, r = {self.r} and oft_block_size = {self.oft_block_size}."
-            )
-        if not (self.r != 0) ^ (self.oft_block_size != 0):
-            raise ValueError(
-                f"You can only specify either r ({self.r}) or oft_block_size ({self.oft_block_size}), but not both simultaneously, because r x oft_block_size == in_features."
-            )
+        # if target_modules is a regex expression, then layers_to_transform should be None
+        if isinstance(self.target_modules, str) and self.layers_to_transform is not None:
+            raise ValueError("`layers_to_transform` cannot be used when `target_modules` is a str.")
+
+        # if target_modules is a regex expression, then layers_pattern should be None
+        if isinstance(self.target_modules, str) and self.layers_pattern is not None:
+            raise ValueError("`layers_pattern` cannot be used when `target_modules` is a str.")
 
     @classmethod
     def check_kwargs(cls, **kwargs):

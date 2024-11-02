@@ -36,7 +36,7 @@ from .layer import PloraLayer, PloraLinear
 
 
 class PloraModel(BaseTuner):
-    prefix: str = "plora_"
+    prefix: str = "lora_"#注意这里如果时lora_A就是lora_;如果时plora_A就是plora
 
     def __init__(self, model, config, adapter_name, low_cpu_mem_usage: bool = False) -> None:
         super().__init__(model, config, adapter_name, low_cpu_mem_usage=low_cpu_mem_usage)
@@ -81,8 +81,8 @@ class PloraModel(BaseTuner):
             "r": r,
             "lora_dropout": plora_config.lora_dropout,
             "fan_in_fan_out": plora_config.fan_in_fan_out,
-            "init_lora_weights": plora_config.init_lora_weights,
-            "ephemeral_gpu_offload": plora_config.runtime_config.ephemeral_gpu_offload,
+            "init_weights": plora_config.init_weights,
+            # "ephemeral_gpu_offload": plora_config.runtime_config.ephemeral_gpu_offload,
         }
 
         if isinstance(target, PloraLayer):
